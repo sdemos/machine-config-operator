@@ -80,47 +80,55 @@ func (dn *Daemon) Run(stop <-chan struct{}) error {
 	glog.Info("Starting MachineConfigDaemon")
 	defer glog.Info("Shutting down MachineConfigDaemon")
 
-	err := dn.process()
-	if err != nil {
+	degraded, err := dn.process()
+	if degraded {
 		glog.Errorf("Marking degraded due to: %v", err)
 		return setUpdateDegraded(dn.kubeClient.CoreV1().Nodes(), dn.name)
+	} else if err != nil {
+		glog.Errorf("node reconciliation failed due to: %v", err)
+		return err
 	}
 
 	return nil
 }
 
-// process starts the main loop that actually does all the work.
-func (dn *Daemon) process() error {
+// process starts the main loop that actually does all the work. if the node is
+// in a degraded state, it returns degraded == true, and also provides an
+// explanation in the error return. if it's a regular error, but the node is in
+// an okay state, it returns a non-nil error value with the issue. otherwise, it
+// doesn't return.
+func (dn *Daemon) process() (bool, error) {
 
 	// do a first pass before entering the main loop
-	if err := dn.syncOnce(); err != nil {
-		return err
+	if degraded, err := dn.syncOnce(); err != nil {
+		return degraded, err
 	}
 
 	for {
 		glog.V(2).Infof("Watching for node annotation updates on %q", dn.name)
 		if err := waitUntilUpdate(dn.kubeClient.CoreV1().Nodes(), dn.name); err != nil {
-			return err
+			return true, err
 		}
-		if err := dn.syncOnce(); err != nil {
-			return err
+		if degraded, err := dn.syncOnce(); err != nil {
+			return degraded, err
 		}
 	}
 }
 
-// syncOnce only completes once.
-func (dn *Daemon) syncOnce() error {
+// syncOnce only completes once. returns true if the node is in a degraded
+// state, with an explanation in the error field.
+func (dn *Daemon) syncOnce() (bool, error) {
 	// validate that the machine correctly made it to the target state
 	isDesired, err := dn.isDesiredMachineState()
 	if err != nil {
-		return err
+		return true, err
 	}
 
 	if !isDesired {
 		// this currently doesn't return, but may return in the future if the
 		// update could be done without rebooting
 		if err := dn.triggerUpdate(); err != nil {
-			return err
+			return true, err
 		}
 
 		glog.V(2).Infof("Successfully updated without reboot")
@@ -129,19 +137,19 @@ func (dn *Daemon) syncOnce() error {
 	}
 
 	if err := setUpdateDone(dn.kubeClient.CoreV1().Nodes(), dn.name); err != nil {
-		return err
+		return true, err
 	}
 
 	node, err := dn.kubeClient.CoreV1().Nodes().Get(dn.name, metav1.GetOptions{})
 	if err != nil {
-		return err
+		return true, err
 	}
 	err = drain.Uncordon(dn.kubeClient.CoreV1().Nodes(), node, nil)
 	if err != nil {
-		return err
+		return true, err
 	}
 
-	return nil
+	return false, nil
 }
 
 // triggerUpdate starts the update using the current and the target config.
